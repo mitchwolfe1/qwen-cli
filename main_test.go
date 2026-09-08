@@ -75,6 +75,9 @@ func TestPresetsAndPipedInput(t *testing.T) {
 			if request["stream"] != true || request["reasoning_format"] != "deepseek" {
 				t.Error("streaming or reasoning parsing disabled")
 			}
+			if request["ignore_eos"] != false {
+				t.Error("normal requests should allow the model to finish early")
+			}
 			if stops := request["stop"].([]any); len(stops) != 2 || stops[0] != "<|im_end|>" || stops[1] != "<|endoftext|>" {
 				t.Errorf("missing stop markers: %v", stops)
 			}
@@ -159,7 +162,7 @@ func TestIncompleteAndFailedStreams(t *testing.T) {
 		{"data: not JSON\n\n", "invalid response"},
 	} {
 		var output bytes.Buffer
-		err := streamAnswer(strings.NewReader(test.stream), &output)
+		err := streamAnswer(strings.NewReader(test.stream), &output, 0)
 		if err == nil || !strings.Contains(err.Error(), test.expected) {
 			t.Errorf("got %v, want error containing %q", err, test.expected)
 		}
@@ -237,5 +240,93 @@ func TestVersion(t *testing.T) {
 	}
 	if output.String() != "qwen "+version+"\n" {
 		t.Errorf("unexpected version output: %q", output.String())
+	}
+}
+
+func TestExactTokenCountFlags(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		args  []string
+		think bool
+	}{
+		{"separate", []string{"-n", "3", "Hello"}, false},
+		{"attached", []string{"-n3", "Hello"}, false},
+		{"equals", []string{"-n=3", "Hello"}, false},
+		{"after question", []string{"Hello", "-n", "3"}, false},
+		{"with thinking", []string{"-t", "-n", "3", "Hello"}, true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			requests := make(chan map[string]any, 1)
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				var request map[string]any
+				if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+					t.Error(err)
+				}
+				requests <- request
+				w.Header().Set("Content-Type", "text/event-stream")
+				fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"some answer\"},\"finish_reason\":\"length\"}]}\n\n")
+				fmt.Fprint(w, "data: {\"choices\":[],\"usage\":{\"completion_tokens\":3}}\n\ndata: [DONE]\n\n")
+			}))
+			defer server.Close()
+			t.Setenv("QWEN_URL", server.URL)
+			var stdout, stderr bytes.Buffer
+			if err := run(context.Background(), test.args, strings.NewReader(""), &stdout, &stderr); err != nil {
+				t.Fatal(err)
+			}
+			request := <-requests
+			if request["max_tokens"] != float64(3) || request["ignore_eos"] != true {
+				t.Errorf("exact count was not applied: %#v", request)
+			}
+			stops, ok := request["stop"].([]any)
+			if !ok || len(stops) != 0 {
+				t.Errorf("expected an empty stop array, got %#v", request["stop"])
+			}
+			if request["stream_options"].(map[string]any)["include_usage"] != true {
+				t.Error("token usage was not requested")
+			}
+			if request["chat_template_kwargs"].(map[string]any)["enable_thinking"] != test.think {
+				t.Error("-n changed the thinking mode")
+			}
+			if stdout.String() != "some answer\n" {
+				t.Errorf("answer: %q", stdout.String())
+			}
+			if strings.Contains(stderr.String(), "incomplete") {
+				t.Errorf("intentional token cutoff was reported as a failure: %s", stderr.String())
+			}
+		})
+	}
+}
+
+func TestInvalidTokenCounts(t *testing.T) {
+	for _, args := range [][]string{
+		{"-n"}, {"-n", "0"}, {"-n", "-1"}, {"-n", "1.5"},
+		{"-n", "abc"}, {"-n="}, {"-n", "2147483648"}, {"-n", "-t"},
+	} {
+		err := run(context.Background(), args, strings.NewReader(""), io.Discard, io.Discard)
+		var badUsage usageError
+		if !errors.As(err, &badUsage) || !strings.Contains(err.Error(), "-n") {
+			t.Errorf("%v: expected token count usage error, got %v", args, err)
+		}
+	}
+}
+
+func TestExactTokenCountValidation(t *testing.T) {
+	for _, test := range []struct{ event, expected string }{
+		{`{"choices":[{"delta":{"content":"answer"},"finish_reason":"length"}],"usage":{"completion_tokens":3}}`, ""},
+		{`{"choices":[{"delta":{"content":"answer"},"finish_reason":"stop"}],"usage":{"completion_tokens":2}}`, "generated 2 tokens"},
+		{`{"choices":[{"delta":{"content":"answer"},"finish_reason":"length"}],"usage":{"completion_tokens":2}}`, "generated 2 tokens"},
+		{`{"choices":[{"delta":{"content":"answer"},"finish_reason":"length"}]}`, "did not report a token count"},
+		{`{"choices":[{"delta":{"content":"answer"},"finish_reason":"length"}],"usage":{}}`, "did not report a token count"},
+		{`{"choices":[{"delta":{"reasoning_content":"thinking"},"finish_reason":"length"}],"usage":{"completion_tokens":3}}`, "before any answer text"},
+	} {
+		var output bytes.Buffer
+		err := streamAnswer(strings.NewReader("data: "+test.event+"\n\ndata: [DONE]\n\n"), &output, 3)
+		if test.expected == "" {
+			if err != nil {
+				t.Errorf("correct token count was rejected: %v", err)
+			}
+		} else if err == nil || !strings.Contains(err.Error(), test.expected) {
+			t.Errorf("expected %q, got %v", test.expected, err)
+		}
 	}
 }

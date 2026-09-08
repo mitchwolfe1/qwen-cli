@@ -56,6 +56,7 @@ checked; they have not been run on their target machines here.
 ```sh
 qwen "How do I sort a Python dictionary?"
 qwen -t "Why does this async code deadlock?"
+qwen -n 100 "Explain Python slicing"
 git diff | qwen -t "Check this for bugs"
 printf 'Explain Python slicing' | qwen
 qwen "Explain this" > answer.txt
@@ -66,9 +67,24 @@ Default mode uses temperature 0.7, top-p 0.8, and presence penalty 1.5.
 penalty 0. Both use top-k 20, min-p 0, and repeat penalty 1.
 
 Only the answer streams to stdout. Thinking status and errors go to stderr.
-The model's reasoning trace is not printed. The output limits are 4,096 tokens
-normally and 8,192 with thinking, including reasoning tokens; reaching the limit
-is reported as an incomplete answer. Ctrl-C cancels the request.
+The model's reasoning trace is not printed. Without `-n`, the output limits are
+4,096 tokens normally and 8,192 with thinking; reaching these default limits is
+reported as an incomplete answer. Ctrl-C cancels the request.
+
+### Exact token count
+
+Use `-n N` to request exactly N generated tokens. `-n100` and `-n=100` also work.
+The CLI automatically disables early end-of-sequence stopping and clears stop
+strings. Reaching the requested count is a successful completion, even if the
+answer is cut off mid-sentence; the server's reported token count is checked.
+
+The count includes reasoning tokens with `-t`, so a small count may be spent
+entirely on hidden thinking. If no answer text is produced, the CLI reports that
+on stderr and exits nonzero. These are model-generated tokens, not words or a
+retokenization of the printed answer; the CLI may append a terminal newline.
+Context limits, transport errors, cancellation, and the five-minute request
+timeout can still interrupt generation. Suppressing early stops may also make
+the model continue awkwardly after it has finished its answer.
 
 ## Server address
 
