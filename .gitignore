@@ -1,0 +1,4 @@
+/dist/
+/qwen
+*.test
+.DS_Store
