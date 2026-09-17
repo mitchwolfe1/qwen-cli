@@ -22,20 +22,23 @@ const defaultURL = "http://athena:8080"
 
 var version = "dev"
 
-const usage = `Usage: qwen [-t] [-n N] [question ...]
+const usage = `Usage: qwen [-t] [-n N] [--prefill TEXT] [question ...]
 
 Ask Qwen a quick question. Add -t for thinking on harder problems.
 Piped input is appended as context, or used as the question if none is given.
 
-  -t, --think   Use the thinking/coding preset
-  -n N          Generate exactly N tokens (includes thinking tokens with -t)
-  -h, --help    Show this help
-      --version Show the installed version
+  -t, --think        Use the thinking/coding preset and print thinking tokens
+  -n N               Generate exactly N new tokens (includes thinking with -t)
+      --prefill TEXT  Start the answer with TEXT (starts thinking with -t)
+  -h, --help         Show this help
+      --version     Show the installed version
 
 Server: http://athena:8080 (override with QWEN_URL)
 
 Examples:
   qwen "Explain Python slicing"
+  qwen "Why is the sky blue?" --prefill "The sky is blue because"
+  qwen -t "Why is the sky blue?" --prefill "Let me think about light."
   qwen -n 100 "Explain Python slicing"
   git diff | qwen -t "Check this for bugs"
   QWEN_URL=http://192.168.1.10:8080 qwen "Hello"
@@ -79,6 +82,7 @@ func main() {
 func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	think, parseFlags := false, true
 	numTokens := 0
+	prefill := ""
 	var words []string
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
@@ -90,12 +94,23 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 			case "-t", "--think":
 				think = true
 				continue
+			case "--prefill":
+				i++
+				if i == len(args) {
+					return usageError("--prefill requires text (use --prefill '' for an empty prefix)")
+				}
+				prefill = args[i]
+				continue
 			case "-h", "--help":
 				_, err := io.WriteString(stdout, usage)
 				return err
 			case "--version":
 				_, err := fmt.Fprintln(stdout, "qwen", version)
 				return err
+			}
+			if strings.HasPrefix(arg, "--prefill=") {
+				prefill = strings.TrimPrefix(arg, "--prefill=")
+				continue
 			}
 			if strings.HasPrefix(arg, "-n") {
 				value := strings.TrimPrefix(strings.TrimPrefix(arg, "-n"), "=")
@@ -145,20 +160,18 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 		stops = []string{}
 	}
 	payload := map[string]any{
-		"model":                "qwen3.5",
-		"messages":             []map[string]string{{"role": "user", "content": prompt}},
-		"temperature":          temperature,
-		"top_p":                topP,
-		"top_k":                20,
-		"min_p":                0.0,
-		"presence_penalty":     presence,
-		"repeat_penalty":       1.0,
-		"max_tokens":           maxTokens,
-		"chat_template_kwargs": map[string]bool{"enable_thinking": think},
-		"reasoning_format":     "deepseek",
-		"stop":                 stops,
-		"ignore_eos":           numTokens > 0,
-		"stream":               true,
+		"model":            "qwen3.5",
+		"prompt":           completionPrompt(prompt, prefill, think),
+		"temperature":      temperature,
+		"top_p":            topP,
+		"top_k":            20,
+		"min_p":            0.0,
+		"presence_penalty": presence,
+		"repeat_penalty":   1.0,
+		"max_tokens":       maxTokens,
+		"stop":             stops,
+		"ignore_eos":       numTokens > 0,
+		"stream":           true,
 	}
 	if numTokens > 0 {
 		payload["stream_options"] = map[string]bool{"include_usage": true}
@@ -190,7 +203,20 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 		message, _ := io.ReadAll(io.LimitReader(response.Body, 64*1024))
 		return fmt.Errorf("HTTP %s: %s", response.Status, strings.TrimSpace(string(message)))
 	}
-	return streamAnswer(response.Body, stdout, numTokens)
+	outputPrefix := prefill
+	if think {
+		// The opening tag is part of the prompt, so the server won't echo it.
+		outputPrefix = "<think>\n" + prefill
+	}
+	return streamAnswer(response.Body, stdout, numTokens, outputPrefix)
+}
+
+func completionPrompt(question, prefill string, think bool) string {
+	prompt := "<|im_start|>user\n" + question + "<|im_end|>\n<|im_start|>assistant\n<think>\n"
+	if !think {
+		prompt += "\n</think>\n\n"
+	}
+	return prompt + prefill
 }
 
 func completionURL(base string) (string, error) {
@@ -205,16 +231,19 @@ func completionURL(base string) (string, error) {
 	u.Path = strings.TrimRight(u.Path, "/")
 	switch {
 	case strings.HasSuffix(u.Path, "/v1/chat/completions"):
+		// Keep existing QWEN_URL overrides working with the raw endpoint.
+		u.Path = strings.TrimSuffix(u.Path, "/chat/completions") + "/completions"
+	case strings.HasSuffix(u.Path, "/v1/completions"):
 	case strings.HasSuffix(u.Path, "/v1"):
-		u.Path += "/chat/completions"
+		u.Path += "/completions"
 	default:
-		u.Path += "/v1/chat/completions"
+		u.Path += "/v1/completions"
 	}
 	u.RawPath = ""
 	return u.String(), nil
 }
 
-func streamAnswer(input io.Reader, output io.Writer, numTokens int) error {
+func streamAnswer(input io.Reader, output io.Writer, numTokens int, outputPrefix string) error {
 	scanner := bufio.NewScanner(input)
 	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
 	lastText, finishReason := "", ""
@@ -233,9 +262,7 @@ func streamAnswer(input io.Reader, output io.Writer, numTokens int) error {
 		}
 		var event struct {
 			Choices []struct {
-				Delta struct {
-					Content string `json:"content"`
-				} `json:"delta"`
+				Text         string  `json:"text"`
 				FinishReason *string `json:"finish_reason"`
 			} `json:"choices"`
 			Error json.RawMessage `json:"error"`
@@ -253,7 +280,14 @@ func streamAnswer(input io.Reader, output io.Writer, numTokens int) error {
 			generatedTokens = *event.Usage.CompletionTokens
 		}
 		for _, choice := range event.Choices {
-			if text := choice.Delta.Content; text != "" {
+			if text := choice.Text; text != "" {
+				// Print the supplied prefix once, without counting it as generated text.
+				if outputPrefix != "" {
+					if _, err := io.WriteString(output, outputPrefix); err != nil {
+						return err
+					}
+					outputPrefix = ""
+				}
 				if _, err := io.WriteString(output, text); err != nil {
 					return err
 				}
@@ -287,7 +321,7 @@ func streamAnswer(input io.Reader, output io.Writer, numTokens int) error {
 	}
 	if lastText == "" {
 		if numTokens > 0 {
-			return errors.New("the -n token limit was reached before any answer text was produced (thinking tokens count too)")
+			return errors.New("the -n token limit was reached before any response text was produced")
 		}
 		return errors.New("the server returned no answer")
 	}

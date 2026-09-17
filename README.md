@@ -56,6 +56,7 @@ checked; they have not been run on their target machines here.
 ```sh
 qwen "How do I sort a Python dictionary?"
 qwen -t "Why does this async code deadlock?"
+qwen "Why is the sky blue?" --prefill "The sky is blue because"
 qwen -n 100 "Explain Python slicing"
 git diff | qwen -t "Check this for bugs"
 printf 'Explain Python slicing' | qwen
@@ -66,10 +67,52 @@ Default mode uses temperature 0.7, top-p 0.8, and presence penalty 1.5.
 `-t` uses the thinking/coding preset: temperature 0.6, top-p 0.95, and presence
 penalty 0. Both use top-k 20, min-p 0, and repeat penalty 1.
 
-Only the answer streams to stdout. Thinking status and errors go to stderr.
-The model's reasoning trace is not printed. Without `-n`, the output limits are
-4,096 tokens normally and 8,192 with thinking; reaching these default limits is
-reported as an incomplete answer. Ctrl-C cancels the request.
+The response streams to stdout, including the supplied prefill and, with `-t`,
+the model's thinking inside `<think>...</think>` before the answer. Redirecting
+stdout captures the thinking too. Status and errors go to stderr. Without `-n`,
+the output limits are 4,096 new tokens normally and 8,192 with thinking;
+reaching these default limits is reported as an incomplete answer. Ctrl-C
+cancels the request.
+
+### Prefill
+
+Use `--prefill TEXT` (or `--prefill=TEXT`) to supply the start of Qwen's response.
+Flags can appear before or after the question. The prefill is preserved exactly,
+including whitespace, and printed once before the generated continuation.
+
+The CLI sends a raw prompt to `/v1/completions`, using Qwen's
+[standard text chat template](https://huggingface.co/Qwen/Qwen3.5-35B-A3B/blob/main/chat_template.jinja).
+For example:
+
+```sh
+qwen "Why is the sky blue?" --prefill "The sky is blue because"
+```
+
+produces this prompt:
+
+```text
+<|im_start|>user
+Why is the sky blue?<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
+The sky is blue because
+```
+
+There is no extra newline after the prefill. Without `-t`, the empty thinking
+block starts generation directly in the answer. With `-t`, the thinking block
+is left open, so the prefill starts the **thinking text**:
+
+```sh
+qwen -t "Why is the sky blue?" --prefill "Let me think about light."
+```
+
+That prompt ends with `<think>\nLet me think about light.`. Qwen continues the
+thought, closes `</think>`, and then writes its answer; all of it is visible as
+it streams. A prefill combined with `-t` does not reserve a prefix for the final
+answer after thinking.
 
 ### Exact token count
 
@@ -79,9 +122,12 @@ strings. Reaching the requested count is a successful completion, even if the
 answer is cut off mid-sentence; the server's reported token count is checked.
 
 The count includes reasoning tokens with `-t`, so a small count may be spent
-entirely on hidden thinking. If no answer text is produced, the CLI reports that
-on stderr and exits nonzero. These are model-generated tokens, not words or a
-retokenization of the printed answer; the CLI may append a terminal newline.
+entirely on visible thinking. That is a successful completion when the server
+reports the requested count, even if the thinking block has not closed yet.
+The supplied prefill and template tokens do not count toward `-n`. These are
+model-generated tokens, not words or a retokenization of the printed response;
+the CLI may append a terminal newline. If no response text is produced at all,
+the CLI reports that on stderr and exits nonzero.
 Context limits, transport errors, cancellation, and the five-minute request
 timeout can still interrupt generation. Suppressing early stops may also make
 the model continue awkwardly after it has finished its answer.
@@ -98,7 +144,8 @@ QWEN_URL=http://192.168.1.10:8080 qwen "Hello"
 
 To keep the override, add `export QWEN_URL=http://192.168.1.10:8080` to your shell
 configuration. `QWEN_URL` also accepts a URL ending in `/v1` or the full
-`/v1/chat/completions` endpoint. HTTP and HTTPS are supported.
+`/v1/completions` endpoint. Existing `/v1/chat/completions` URLs are redirected
+to `/v1/completions` by the CLI. HTTP and HTTPS are supported.
 
 ## Build
 
